@@ -2,10 +2,8 @@
 FROM golang:1.22-alpine AS builder
 
 WORKDIR /app
-COPY go.mod ./
-RUN go mod tidy
-
 COPY . .
+RUN go mod tidy
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o aevum-cloud .
 
 # Runtime stage: ultra-compact alpine
