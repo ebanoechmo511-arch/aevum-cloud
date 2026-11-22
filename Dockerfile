@@ -3,7 +3,7 @@ FROM golang:1.22-alpine AS builder
 
 WORKDIR /app
 COPY . .
-RUN go mod tidy
+RUN rm -f go.sum && go mod tidy
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o aevum-cloud .
 
 # Runtime stage: ultra-compact alpine
