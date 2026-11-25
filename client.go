@@ -24,6 +24,8 @@ type Client struct {
 
 	uid        uint64
 	username   string
+	clientNick string
+	gameIGN    string
 	hwid       string
 	serverIP   string
 	partyID    string

@@ -63,10 +63,13 @@ func BuildVoiceDown(senderUID uint64, flags byte, voiceRange byte, seq uint16, o
 
 // JSON Message formats
 type TextMsgIn struct {
-	Type     string `json:"type"` // "auth", "chat", "state", "party", "waypoint"
-	Username string `json:"username,omitempty"`
-	HWID     string `json:"hwid,omitempty"`
-	ServerIP string `json:"server_ip,omitempty"`
+	Type       string `json:"type"` // "auth", "claim_nick", "ign_sync", "chat", "state", "party", "waypoint"
+	Username   string `json:"username,omitempty"`
+	HWID       string `json:"hwid,omitempty"`
+	ServerIP   string `json:"server_ip,omitempty"`
+	ClientNick string `json:"client_nick,omitempty"`
+	ClientUID  int64  `json:"client_uid,omitempty"`
+	GameIGN    string `json:"game_ign,omitempty"`
 
 	// Chat
 	Channel  string `json:"channel,omitempty"` // "global", "server", "party", "dm"
@@ -97,13 +100,18 @@ type TextMsgIn struct {
 }
 
 type TextMsgOut struct {
-	Type      string      `json:"type"`
-	Timestamp int64       `json:"timestamp,omitempty"`
-	SenderUID uint64      `json:"sender_uid,omitempty"`
-	Sender    string      `json:"sender,omitempty"`
-	Channel   string      `json:"channel,omitempty"`
-	Target    string      `json:"target,omitempty"`
-	Message   string      `json:"message,omitempty"`
-	Data      interface{} `json:"data,omitempty"`
-	Online    int         `json:"online,omitempty"`
+	Type       string      `json:"type"`
+	Timestamp  int64       `json:"timestamp,omitempty"`
+	SenderUID  uint64      `json:"sender_uid,omitempty"`
+	Sender     string      `json:"sender,omitempty"`
+	ClientNick string      `json:"client_nick,omitempty"`
+	ClientUID  int64       `json:"client_uid,omitempty"`
+	GameIGN    string      `json:"game_ign,omitempty"`
+	Success    bool        `json:"success,omitempty"`
+	Error      string      `json:"error,omitempty"`
+	Channel    string      `json:"channel,omitempty"`
+	Target     string      `json:"target,omitempty"`
+	Message    string      `json:"message,omitempty"`
+	Data       interface{} `json:"data,omitempty"`
+	Online     int         `json:"online,omitempty"`
 }

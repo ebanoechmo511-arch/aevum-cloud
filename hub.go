@@ -2,8 +2,10 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"math"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -14,6 +16,7 @@ type Hub struct {
 	clientsMu  sync.RWMutex
 	register   chan *Client
 	unregister chan *Client
+	registry   *Registry
 
 	nextUID uint64
 }
@@ -23,7 +26,8 @@ func NewHub() *Hub {
 		clients:    make(map[*Client]bool),
 		register:   make(chan *Client),
 		unregister: make(chan *Client),
-		nextUID:    1000,
+		registry:   NewRegistry("registry.json"),
+		nextUID:    1,
 	}
 }
 
@@ -41,14 +45,30 @@ func (h *Hub) Run() {
 			log.Printf("[+] Подключен сокет (UID: %d)", c.uid)
 
 		case c := <-h.unregister:
+			var offlineNick, offlineIgn string
+			var wasAuthed bool
 			h.clientsMu.Lock()
 			if _, ok := h.clients[c]; ok {
+				c.mu.RLock()
+				offlineNick = c.clientNick
+				offlineIgn = c.gameIGN
+				wasAuthed = c.authorized
+				c.mu.RUnlock()
 				delete(h.clients, c)
 				close(c.sendText)
 				close(c.sendBin)
 				log.Printf("[-] Отключен юзер %s (UID: %d)", c.username, c.uid)
 			}
 			h.clientsMu.Unlock()
+			if wasAuthed && offlineNick != "" {
+				offMsg, _ := json.Marshal(TextMsgOut{
+					Type:       "user_offline",
+					ClientNick: offlineNick,
+					GameIGN:    offlineIgn,
+					Timestamp:  time.Now().UnixMilli(),
+				})
+				h.broadcastAllText(offMsg)
+			}
 			h.broadcastOnline()
 
 		case <-radarTicker.C:
@@ -59,7 +79,20 @@ func (h *Hub) Run() {
 
 func (h *Hub) broadcastOnline() {
 	h.clientsMu.RLock()
-	online := len(h.clients)
+	seen := make(map[string]bool)
+	for c := range h.clients {
+		if !c.authorized {
+			continue
+		}
+		c.mu.RLock()
+		key := strings.ToLower(strings.TrimSpace(c.clientNick))
+		if key == "" {
+			key = fmt.Sprintf("uid:%d", c.uid)
+		}
+		c.mu.RUnlock()
+		seen[key] = true
+	}
+	online := len(seen)
 	h.clientsMu.RUnlock()
 
 	msg, _ := json.Marshal(TextMsgOut{
@@ -89,35 +122,133 @@ func (h *Hub) handleText(c *Client, payload []byte) {
 	}
 
 	switch in.Type {
+	case "claim_nick":
+		uid, canonNick, err := h.registry.ClaimNick(in.ClientNick, in.HWID)
+		var resp []byte
+		if err != nil {
+			resp, _ = json.Marshal(TextMsgOut{
+				Type:      "claim_result",
+				Success:   false,
+				Error:     err.Error(),
+				Timestamp: time.Now().UnixMilli(),
+			})
+		} else {
+			resp, _ = json.Marshal(TextMsgOut{
+				Type:       "claim_result",
+				Success:    true,
+				ClientNick: canonNick,
+				ClientUID:  uid,
+				Timestamp:  time.Now().UnixMilli(),
+			})
+			log.Printf("[NickClaim] Закреплен ник: %s -> UID: %d (HWID: %s)", canonNick, uid, in.HWID)
+		}
+		c.sendText <- resp
+
 	case "auth":
 		c.mu.Lock()
 		c.username = in.Username
+		if in.ClientNick != "" {
+			c.clientNick = in.ClientNick
+		} else {
+			c.clientNick = in.Username
+		}
+		if in.ClientUID > 0 {
+			c.uid = uint64(in.ClientUID)
+		}
+		if in.GameIGN != "" {
+			c.gameIGN = in.GameIGN
+		} else {
+			c.gameIGN = in.Username
+		}
 		c.hwid = in.HWID
 		c.serverIP = in.ServerIP
 		c.authorized = true
+		authNick := c.clientNick
+		authHwid := c.hwid
 		c.mu.Unlock()
 
-		// Welcome response with assigned UID
+		// Evict any stale duplicate socket from the same HWID or clientNick
+		h.clientsMu.Lock()
+		for other := range h.clients {
+			if other == c {
+				continue
+			}
+			other.mu.RLock()
+			sameNick := authNick != "" && strings.EqualFold(other.clientNick, authNick)
+			sameHwid := authHwid != "" && other.hwid == authHwid
+			other.mu.RUnlock()
+			if sameNick || sameHwid {
+				delete(h.clients, other)
+				close(other.sendText)
+				_ = other.conn.Close()
+			}
+		}
+		h.clientsMu.Unlock()
+
+		// Welcome response with assigned UID and ClientNick
 		resp, _ := json.Marshal(TextMsgOut{
-			Type:      "auth_success",
-			SenderUID: c.uid,
-			Sender:    c.username,
-			Timestamp: time.Now().UnixMilli(),
+			Type:       "auth_success",
+			SenderUID:  c.uid,
+			Sender:     c.username,
+			ClientNick: c.clientNick,
+			ClientUID:  int64(c.uid),
+			GameIGN:    c.gameIGN,
+			Timestamp:  time.Now().UnixMilli(),
 		})
 		c.sendText <- resp
 
-		log.Printf("[Auth] Юзер: %s (HWID: %s, Server: %s)", in.Username, in.HWID, in.ServerIP)
+		log.Printf("[Auth] Клиент: %s (UID: %d, IGN: %s, HWID: %s, Server: %s)", c.clientNick, c.uid, c.gameIGN, in.HWID, in.ServerIP)
 		h.broadcastOnline()
+		h.syncIgnDirectory(c)
 
 		// Alert users on the same Minecraft server
 		if in.ServerIP != "" {
 			h.alertServerUsers(c, in.ServerIP)
 		}
 
+	case "ign_sync":
+		if in.GameIGN == "" {
+			return
+		}
+		c.mu.Lock()
+		c.gameIGN = in.GameIGN
+		if c.clientNick == "" {
+			c.clientNick = c.username
+		}
+		cNick := c.clientNick
+		cUID := int64(c.uid)
+		sIP := c.serverIP
+		c.mu.Unlock()
+
+		log.Printf("[IGNSync] Юзер %s (UID: %d) теперь играет как: %s", cNick, cUID, in.GameIGN)
+		msg, _ := json.Marshal(TextMsgOut{
+			Type:       "ign_update",
+			ClientNick: cNick,
+			ClientUID:  cUID,
+			GameIGN:    in.GameIGN,
+			Message:    sIP,
+			Timestamp:  time.Now().UnixMilli(),
+		})
+		h.broadcastAllText(msg)
+
 	case "server_change":
 		c.mu.Lock()
 		c.serverIP = in.ServerIP
+		cNick := c.clientNick
+		cUID := int64(c.uid)
+		gIGN := c.gameIGN
 		c.mu.Unlock()
+		if cNick != "" && gIGN != "" {
+			msg, _ := json.Marshal(TextMsgOut{
+				Type:       "ign_update",
+				ClientNick: cNick,
+				ClientUID:  cUID,
+				GameIGN:    gIGN,
+				Message:    in.ServerIP,
+				Timestamp:  time.Now().UnixMilli(),
+			})
+			h.broadcastAllText(msg)
+		}
 		if in.ServerIP != "" {
 			h.alertServerUsers(c, in.ServerIP)
 		}
@@ -223,21 +354,31 @@ func (h *Hub) sendBinSafe(c *Client, data []byte) {
 }
 
 func (h *Hub) routeChat(sender *Client, in TextMsgIn) {
+	sender.mu.RLock()
+	sNick := sender.clientNick
+	sIGN := sender.gameIGN
+	sServer := sender.serverIP
+	sParty := sender.partyID
+	sUID := sender.uid
+	sUsername := sender.username
+	sender.mu.RUnlock()
+
 	out := TextMsgOut{
-		Type:      "chat",
-		Timestamp: time.Now().UnixMilli(),
-		SenderUID: sender.uid,
-		Sender:    sender.username,
-		Channel:   in.Channel,
-		Target:    in.Target,
-		Message:   in.Message,
+		Type:       "chat",
+		Timestamp:  time.Now().UnixMilli(),
+		SenderUID:  sUID,
+		Sender:     sUsername,
+		ClientNick: sNick,
+		ClientUID:  int64(sUID),
+		GameIGN:    sIGN,
+		Channel:    in.Channel,
+		Target:     in.Target,
+		Message:    in.Message,
 	}
 	bytes, _ := json.Marshal(out)
 
-	sender.mu.RLock()
-	senderServer := sender.serverIP
-	senderParty := sender.partyID
-	sender.mu.RUnlock()
+	senderServer := sServer
+	senderParty := sParty
 
 	h.clientsMu.RLock()
 	defer h.clientsMu.RUnlock()
@@ -269,10 +410,75 @@ func (h *Hub) routeChat(sender *Client, in TextMsgIn) {
 
 	case "dm":
 		for c := range h.clients {
-			if c.authorized && (c.username == in.Target || c == sender) {
+			if c.authorized && (c == sender || strings.EqualFold(c.clientNick, in.Target) || strings.EqualFold(c.gameIGN, in.Target) || strings.EqualFold(c.username, in.Target)) {
 				c.sendText <- bytes
 			}
 		}
+	}
+}
+
+type IgnEntry struct {
+	ClientNick string `json:"client_nick"`
+	ClientUID  int64  `json:"client_uid"`
+	GameIGN    string `json:"game_ign"`
+	ServerIP   string `json:"server_ip"`
+}
+
+func (h *Hub) syncIgnDirectory(newUser *Client) {
+	newUser.mu.RLock()
+	newNick := newUser.clientNick
+	newUID := int64(newUser.uid)
+	newIGN := newUser.gameIGN
+	newSrv := newUser.serverIP
+	newUser.mu.RUnlock()
+
+	if newNick != "" {
+		updateMsg, _ := json.Marshal(TextMsgOut{
+			Type:       "ign_update",
+			ClientNick: newNick,
+			ClientUID:  newUID,
+			GameIGN:    newIGN,
+			Message:    newSrv,
+			Timestamp:  time.Now().UnixMilli(),
+		})
+		h.clientsMu.RLock()
+		for c := range h.clients {
+			if c != newUser && c.authorized {
+				select {
+				case c.sendText <- updateMsg:
+				default:
+				}
+			}
+		}
+		h.clientsMu.RUnlock()
+	}
+
+	h.clientsMu.RLock()
+	entries := make([]IgnEntry, 0, len(h.clients))
+	for c := range h.clients {
+		if c.authorized {
+			c.mu.RLock()
+			if c.clientNick != "" {
+				entries = append(entries, IgnEntry{
+					ClientNick: c.clientNick,
+					ClientUID:  int64(c.uid),
+					GameIGN:    c.gameIGN,
+					ServerIP:   c.serverIP,
+				})
+			}
+			c.mu.RUnlock()
+		}
+	}
+	h.clientsMu.RUnlock()
+
+	snapMsg, _ := json.Marshal(TextMsgOut{
+		Type:      "ign_snapshot",
+		Data:      entries,
+		Timestamp: time.Now().UnixMilli(),
+	})
+	select {
+	case newUser.sendText <- snapMsg:
+	default:
 	}
 }
 
@@ -283,10 +489,12 @@ func (h *Hub) alertServerUsers(newUser *Client, serverIP string) {
 	for c := range h.clients {
 		if c != newUser && c.authorized && c.serverIP == serverIP {
 			alert, _ := json.Marshal(TextMsgOut{
-				Type:      "user_alert",
-				Message:   "Юзер AevumDLC " + newUser.username + " играет на твоем сервере!",
-				Sender:    newUser.username,
-				Timestamp: time.Now().UnixMilli(),
+				Type:       "user_alert",
+				Message:    "Юзер AevumDLC " + newUser.clientNick + " играет на твоем сервере!",
+				Sender:     newUser.clientNick,
+				ClientNick: newUser.clientNick,
+				GameIGN:    newUser.gameIGN,
+				Timestamp:  time.Now().UnixMilli(),
 			})
 			select {
 			case c.sendText <- alert:
@@ -305,6 +513,33 @@ func (h *Hub) handleParty(c *Client, in TextMsgIn) {
 		c.partyID = in.Target
 	case "leave":
 		c.partyID = ""
+	case "invite":
+		targetName := in.Target
+		senderName := c.username
+		if c.partyID == "" {
+			c.partyID = senderName
+		}
+		senderParty := c.partyID
+		c.mu.Unlock()
+
+		h.clientsMu.RLock()
+		for targetClient := range h.clients {
+			if targetClient.authorized && (strings.EqualFold(targetClient.clientNick, targetName) || strings.EqualFold(targetClient.gameIGN, targetName) || strings.EqualFold(targetClient.username, targetName)) {
+				inviteMsg, _ := json.Marshal(TextMsgOut{
+					Type:      "party_invite",
+					Sender:    senderName,
+					Channel:   senderParty,
+					Timestamp: time.Now().UnixMilli(),
+				})
+				select {
+				case targetClient.sendText <- inviteMsg:
+				default:
+				}
+				break
+			}
+		}
+		h.clientsMu.RUnlock()
+		return
 	}
 	partyID := c.partyID
 	c.mu.Unlock()
@@ -348,6 +583,8 @@ func (h *Hub) routeWaypoint(sender *Client, in TextMsgIn) {
 type TeammateState struct {
 	UID        uint64  `json:"uid"`
 	Username   string  `json:"username"`
+	ClientNick string  `json:"client_nick"`
+	GameIGN    string  `json:"game_ign"`
 	X          float64 `json:"x"`
 	Y          float64 `json:"y"`
 	Z          float64 `json:"z"`
@@ -381,6 +618,8 @@ func (h *Hub) broadcastRadar() {
 			states = append(states, TeammateState{
 				UID:        m.uid,
 				Username:   m.username,
+				ClientNick: m.clientNick,
+				GameIGN:    m.gameIGN,
 				X:          m.x,
 				Y:          m.y,
 				Z:          m.z,
