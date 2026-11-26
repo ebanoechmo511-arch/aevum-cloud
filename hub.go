@@ -514,17 +514,42 @@ func (h *Hub) handleParty(c *Client, in TextMsgIn) {
 	case "leave":
 		c.partyID = ""
 	case "invite":
-		targetName := in.Target
-		senderName := c.username
+		targetName := strings.TrimSpace(in.Target)
+		senderName := c.clientNick
+		if senderName == "" {
+			senderName = c.username
+		}
+		createdParty := false
 		if c.partyID == "" {
 			c.partyID = senderName
+			createdParty = true
 		}
 		senderParty := c.partyID
 		c.mu.Unlock()
 
+		if createdParty {
+			upd, _ := json.Marshal(TextMsgOut{
+				Type:      "party_update",
+				Channel:   senderParty,
+				Timestamp: time.Now().UnixMilli(),
+			})
+			select {
+			case c.sendText <- upd:
+			default:
+			}
+		}
+
 		h.clientsMu.RLock()
 		for targetClient := range h.clients {
-			if targetClient.authorized && (strings.EqualFold(targetClient.clientNick, targetName) || strings.EqualFold(targetClient.gameIGN, targetName) || strings.EqualFold(targetClient.username, targetName)) {
+			if targetClient == c || !targetClient.authorized {
+				continue
+			}
+			targetClient.mu.RLock()
+			match := strings.EqualFold(targetClient.clientNick, targetName) ||
+				strings.EqualFold(targetClient.gameIGN, targetName) ||
+				strings.EqualFold(targetClient.username, targetName)
+			targetClient.mu.RUnlock()
+			if match {
 				inviteMsg, _ := json.Marshal(TextMsgOut{
 					Type:      "party_invite",
 					Sender:    senderName,
@@ -535,7 +560,6 @@ func (h *Hub) handleParty(c *Client, in TextMsgIn) {
 				case targetClient.sendText <- inviteMsg:
 				default:
 				}
-				break
 			}
 		}
 		h.clientsMu.RUnlock()
